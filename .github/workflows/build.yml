@@ -1,0 +1,115 @@
+name: build
+
+# Builds Factorio headless images and publishes them to GHCR. New versions are
+# built automatically as Wube releases them (version-tagged only), but the
+# `latest` and `stable` pointers — which is what the fleet follows — only move
+# on a manual run, so we decide when servers roll forward.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Factorio version to build (blank = newest experimental from Wube)"
+        required: false
+      move_latest:
+        description: "Point :latest at this build"
+        type: boolean
+        default: false
+      move_stable:
+        description: "Point :stable at this build"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 12 * * *"
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/factorio
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve versions to build
+        id: resolve
+        run: |
+          set -euo pipefail
+          releases=$(curl -fsSL https://factorio.com/api/latest-releases)
+          exp=$(echo "$releases" | jq -r '.experimental.headless // empty')
+          stable=$(echo "$releases" | jq -r '.stable.headless // empty')
+
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            todo="${{ github.event.inputs.version }}"
+          else
+            # Scheduled run: build any Wube-listed version we don't already have.
+            have=$(jq -r '.versions[]?' versions.json 2>/dev/null | tr '\n' ' ')
+            todo=""
+            for v in $exp $stable; do
+              case " $have " in *" $v "*) ;; *) todo="$todo $v" ;; esac
+            done
+          fi
+          echo "versions=$(echo $todo | xargs)" >> "$GITHUB_OUTPUT"
+          echo "Will build: $(echo $todo | xargs)"
+
+      - uses: docker/login-action@v3
+        if: steps.resolve.outputs.versions != ''
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        if: steps.resolve.outputs.versions != ''
+        run: |
+          set -euo pipefail
+          for v in ${{ steps.resolve.outputs.versions }}; do
+            echo "::group::build $v"
+            curl -fsSL "https://www.factorio.com/get-download/$v/headless/linux64" -o /tmp/f.tar.xz
+            sha=$(sha256sum /tmp/f.tar.xz | cut -d' ' -f1)
+
+            tags="-t $IMAGE:$v"
+            [ "${{ github.event.inputs.move_latest }}" = "true" ] && tags="$tags -t $IMAGE:latest"
+            [ "${{ github.event.inputs.move_stable }}" = "true" ] && tags="$tags -t $IMAGE:stable"
+
+            docker build --platform linux/amd64 \
+              --build-arg VERSION="$v" --build-arg SHA256="$sha" \
+              $tags docker
+            for t in $v ${{ github.event.inputs.move_latest == 'true' && 'latest' || '' }} ${{ github.event.inputs.move_stable == 'true' && 'stable' || '' }}; do
+              docker push "$IMAGE:$t"
+            done
+            echo "::endgroup::"
+          done
+
+      - name: Update versions.json
+        if: steps.resolve.outputs.versions != ''
+        run: |
+          set -euo pipefail
+          built="${{ steps.resolve.outputs.versions }}"
+          latest_in="${{ github.event.inputs.move_latest == 'true' && 'yes' || 'no' }}"
+          stable_in="${{ github.event.inputs.move_stable == 'true' && 'yes' || 'no' }}"
+          # newest built version (manual builds are usually a single version)
+          newest=$(echo $built | tr ' ' '\n' | sort -V | tail -1)
+
+          jq \
+            --arg newest "$newest" \
+            --arg latest_in "$latest_in" \
+            --arg stable_in "$stable_in" \
+            --argjson built "$(printf '%s\n' $built | jq -R . | jq -s .)" \
+            '
+            .versions = ((.versions // []) + $built | unique_by(split(".") | map(tonumber)) | sort_by(split(".") | map(tonumber)) | reverse)
+            | (if $latest_in == "yes" then .latest = $newest else . end)
+            | (if $stable_in == "yes" then .stable = $newest else . end)
+            ' versions.json > versions.json.tmp
+          mv versions.json.tmp versions.json
+          cat versions.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add versions.json
+          git commit -m "Publish ${built// /, }" || { echo "no changes"; exit 0; }
+          git push

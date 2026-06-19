@@ -1,0 +1,55 @@
+#!/bin/bash
+set -eoux pipefail
+INSTALLED_DIRECTORY=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+
+if [[ -z ${1:-} ]]; then
+  echo "No argument supplied"
+fi
+
+SERVER_SCENARIO="$1"
+PRESET="${PRESET:-""}"
+
+mkdir -p "$SAVES"
+mkdir -p "$CONFIG"
+mkdir -p "$MODS"
+mkdir -p "$SCENARIOS"
+
+#chown -R factorio /factorio
+
+if [[ ! -f $CONFIG/rconpw ]]; then
+  pwgen 15 1 >"$CONFIG/rconpw"
+fi
+
+if [[ ! -f $CONFIG/server-settings.json ]]; then
+  cp /opt/factorio/data/server-settings.example.json "$CONFIG/server-settings.json"
+fi
+
+if [[ ! -f $CONFIG/map-gen-settings.json ]]; then
+  cp /opt/factorio/data/map-gen-settings.example.json "$CONFIG/map-gen-settings.json"
+fi
+
+if [[ ! -f $CONFIG/map-settings.json ]]; then
+  cp /opt/factorio/data/map-settings.example.json "$CONFIG/map-settings.json"
+fi
+
+"${INSTALLED_DIRECTORY}"/docker-dlc.sh
+
+# Setup ARM64 emulation support
+EXEC=""
+# shellcheck disable=SC1091
+source "${INSTALLED_DIRECTORY}/setup-exec.sh"
+
+exec $EXEC /opt/factorio/bin/x64/factorio \
+  --port "$PORT" \
+  --start-server-load-scenario "$SERVER_SCENARIO" \
+  --preset "$PRESET" \
+  --map-gen-settings "$CONFIG/map-gen-settings.json" \
+  --map-settings "$CONFIG/map-settings.json" \
+  --server-settings "$CONFIG/server-settings.json" \
+  --server-banlist "$CONFIG/server-banlist.json" \
+  --server-whitelist "$CONFIG/server-whitelist.json" \
+  --use-server-whitelist \
+  --server-adminlist "$CONFIG/server-adminlist.json" \
+  --rcon-port "$RCON_PORT" \
+  --rcon-password "$(cat "$CONFIG/rconpw")" \
+  --server-id /factorio/config/server-id.json
